@@ -1,0 +1,13 @@
+[package]
+name = "bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cloudflare-bypasser = "0.2.0"
+reqwest = "0.11.9"
+tokio = { version = "1.16.1", features = ["full"] }
+anyhow = "*"
+http = "0.2.6"
+serde_json = "1.0.78" 
+serde = { version = "1.0.126", features = ["derive"] }
