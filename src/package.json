@@ -1,0 +1,15 @@
+{
+  "name": "cloudflare-login-bypass",
+  "version": "1.0.0",
+  "description": "Allows the application to log in and bypass any Cloudflare DDoS protection.",
+  "main": "bypass.ts",
+  "scripts": {
+    "test": "node bypass.ts"
+  },
+  "author": "Osoro Bironga",
+  "license": "ISC",
+  "dependencies": {
+    "cloudscraper": "^4.6.0",
+    "fs": "^0.0.1-security"
+  }
+}
