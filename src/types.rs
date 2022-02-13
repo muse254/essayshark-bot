@@ -1,11 +1,5 @@
 use serde::Deserialize;
 
-#[derive(Debug)]
-pub enum Discard {
-    All,
-    Default, // Rewriting_Editing
-}
-
 #[derive(Deserialize)]
 pub struct OrderPing {
     pub read_time_remain: u32,

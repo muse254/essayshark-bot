@@ -1,4 +1,5 @@
 use bot::types;
+use futures::executor::block_on;
 use http;
 use log::{error, info, trace, warn, LevelFilter};
 use reqwest;
@@ -15,6 +16,7 @@ static COOKIE_FILE: &str = "./src/cookie.txt";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // This allows to filter extra logs such that only error logs are printed.
     SimpleLogger::new()
         .with_module_level("hyper", LevelFilter::Error)
         .with_module_level("mio", LevelFilter::Error)
@@ -25,9 +27,10 @@ async fn main() -> anyhow::Result<()> {
         .init()
         .unwrap();
 
+    // Indicates the start of the program.
     trace!("Program started");
 
-    // construct client with the propagated auth cookie for all requests.
+    // Construct client with the propagated auth cookie for all requests.
     let client = reqwest::ClientBuilder::new()
         .default_headers(retrieve_cookie_from_file())
         .build()
@@ -36,7 +39,14 @@ async fn main() -> anyhow::Result<()> {
     match get_orders(client.clone(), 1).await.new_items {
         Some(available_orders) => {
             // discard all available orders
-            discard_orders(&client, &available_orders, types::Discard::All).await;
+            discard_orders(
+                client.clone(),
+                available_orders
+                    .iter()
+                    .map(|order| order.id.to_string())
+                    .collect::<Vec<String>>(),
+            )
+            .await;
         }
         None => {}
     }
@@ -96,28 +106,9 @@ fn get_orders(
     })
 }
 
-async fn discard_orders(
-    client: &reqwest::Client,
-    available_orders: &Vec<types::NewItem>,
-    opts: types::Discard,
-) {
+async fn discard_orders(client: reqwest::Client, orders: Vec<String>) {
     // early return
-    if available_orders.is_empty() {
-        return;
-    }
-
-    // get ids and collect to array
-    let ids_str = available_orders
-        .iter()
-        .filter(|&item| match &opts {
-            types::Discard::All => true,
-            types::Discard::Default => item.service_type_ar.slug == "editing_rewriting",
-        })
-        .map(|item| item.id.as_str())
-        .collect::<Vec<&str>>();
-
-    // early return
-    if ids_str.is_empty() {
+    if orders.is_empty() {
         return;
     }
 
@@ -126,72 +117,81 @@ async fn discard_orders(
         .form(&[
             ("act", "discard_all"),
             ("nobreath", "1"),
-            ("ids", &ids_str.join(",")),
+            ("ids", &orders.join(",")),
         ])
         .send()
         .await
     {
         Ok(_) => {
-            info!("{:?} discarded", ids_str)
+            info!("{:?} discarded", orders)
         }
         Err(err) => {
             warn!("an error occurred discarding orders: {}", err);
         }
     }
-    info!("available orders with opts {:?} discarded", opts)
 }
 
 async fn find_orders_and_bid(client: &reqwest::Client) {
-    let mut cache = Vec::new();
-
     loop {
         info!("finding new orders to bid to");
+
         // find new orders and bid
         if let Some(available_orders) = get_orders(client.clone(), 1).await.new_items {
-            // silence orders with the tag edit_rewrite tag or that have been cached
-            let ids_str = available_orders
-                .iter()
-                .filter(|&item| {
-                    item.service_type_ar.slug != "editing_rewriting" && !cache.contains(&item.id)
-                })
-                .map(|item| item.id.as_str())
-                .collect::<Vec<&str>>();
-
-            // bid if there are available orders.
-            if !ids_str.is_empty() {
-                // bid first
-                let mut bids: u8 = 0;
-                for item in available_orders
-                    .iter()
-                    .skip_while(|&x| !ids_str.contains(&x.id.as_str()))
-                {
-                    let client_clone = client.clone();
-                    dispatch_order(
-                        client_clone,
-                        item.id.clone(),
-                        item.min_price_total,
-                        item.pages_qty.clone(),
-                    )
-                    .await;
-                    cache.push(item.id.clone());
-                    bids += 1;
-                }
-
-                if bids > 0 {
-                    info!("trying to bid {} order(s)", bids);
-                }
-            } else {
-                // no availble orders
-                info!("no orders to process");
+            if available_orders.is_empty() {
+                continue;
             }
-            // discard editing_rewrite if any needs discarding
-            discard_orders(&client, &available_orders, types::Discard::Default).await;
-        } else {
-            warn!("orders found dropped");
-        }
 
-        // sleep 1 ms then continue loop
-        // thread::sleep(time::Duration::from_millis(1));
+            // bid first
+            let mut bids: u8 = 0;
+            let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            {
+                let ids_str = available_orders
+                    .iter()
+                    .filter(|&item| item.service_type_ar.slug == "editing_rewriting")
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<String>>();
+                let client_clone = client.clone();
+                threads.push(std::thread::spawn(move || {
+                    // discard editing_rewrite if any needs discarding
+                    block_on(discard_orders(client_clone, ids_str))
+                }));
+            }
+
+            // silence orders with the tag edit_rewrite tag or that have been cached
+            for item in available_orders
+                .into_iter()
+                .filter(|item| item.service_type_ar.slug != "editing_rewriting")
+            {
+                let client_clone = client.clone();
+                // let item_clone = item.copy();
+                let item_id = item.id.clone();
+                let item_min_price_total = item.min_price_total.clone();
+                let item_pages_qty = item.pages_qty.clone();
+
+                // the number of available orders per second won't fly say above 10;
+                // so spawning for every order will be relatively safe
+                threads.push(std::thread::spawn(move || {
+                    block_on({
+                        dispatch_order(client_clone, item_id, item_min_price_total, item_pages_qty)
+                    })
+                }));
+
+                bids += 1;
+            }
+
+            if bids > 0 {
+                info!("trying to bid {} order(s)", bids);
+            }
+
+            // wait for all threads to finish in a seperate thread
+            // but continue with program execution; for new orders that might be found
+            std::thread::spawn(move || {
+                for thread in threads {
+                    thread.join().unwrap();
+                }
+            });
+        }
     }
 }
 
