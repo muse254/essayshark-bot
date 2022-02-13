@@ -222,6 +222,7 @@ async fn dispatch_order<'a>(
         min_price_total,
         pages_qty.to_owned(),
         1,
+        false,
     )
     .await
     .await;
@@ -233,6 +234,7 @@ async fn queue_bid<'a>(
     min_price_total: f32,
     pages_qty: String,
     tries: u8,
+    download_dispatch: bool,
 ) -> Pin<Box<dyn Future<Output = ()>>> {
     Box::pin(async move {
         match client
@@ -263,36 +265,51 @@ async fn queue_bid<'a>(
                     }
                 }
 
-                if order_ping.files_download_remain > 0 {
-                    download_file(&client, &item_id).await;
-                }
-
-                //recurse
-                queue_bid(
+                // dispatch the queue asynchronously
+                let queue = queue_bid(
                     client.clone(),
                     item_id.clone(),
                     min_price_total,
                     pages_qty,
                     tries + 1,
-                )
-                .await
-                .await
+                    true,
+                );
+
+                // dispatch the download asynchronously
+                let routine = std::thread::spawn(move || {
+                    if !download_dispatch && order_ping.files_download_remain > 0 {
+                        block_on(download_file(client, item_id))
+                    }
+                });
+
+                // make sure the queue completes
+                queue.await.await;
+
+                // make sure the download thread completes
+                // uninterested in result; the download data is discarded
+                let _ = routine.join();
             }
             Err(err) => {
                 if tries.eq(&BID_TRIES) {
                     error!("{}", err);
                     panic!()
-                } else {
-                    queue_bid(client.clone(), item_id, min_price_total, pages_qty, tries)
-                        .await
-                        .await
                 }
+                queue_bid(
+                    client.clone(),
+                    item_id,
+                    min_price_total,
+                    pages_qty,
+                    tries + 1,
+                    download_dispatch,
+                )
+                .await
+                .await
             }
         }
     })
 }
 
-async fn download_file<'a>(client: &reqwest::Client, order_id: &'a str) {
+async fn download_file<'a>(client: reqwest::Client, order_id: String) {
     match client
         .get(format!(
             "https://essayshark.com/writer/orders/{}.html",
@@ -330,29 +347,26 @@ async fn download_file<'a>(client: &reqwest::Client, order_id: &'a str) {
                             if let Some(err) = client_owned.get(url.to_string()).send().await.err()
                             {
                                 warn!("{}", err);
-                                //    panic!()
                             }
                             info!("download for url {} completed!", url);
                         }
                         Err(err) => {
                             warn!("{}", err);
-                            //  panic!()
                         }
                     }
                 }
 
-                'this: for node in document.into_iter() {
+                // only need to 'download' a single file
+                if let Some(node) = document.first() {
                     let client_clone = client.clone();
                     if let Some(url) = node.attr("href") {
                         download_resource_background(client_clone, url.to_string()).await;
-                        break 'this;
                     }
                 }
             }
         }
         Err(err) => {
             error!("{}", err);
-            // panic!()
         }
     }
 }

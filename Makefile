@@ -6,8 +6,8 @@ run-bot:
 	cargo run --release
 
 .PHONY: get-cookie
-get-cookie:
-	cd src && npm test
+get-cookie: # shouldn't be `npm test` but `npm run start`; it's a hasstle to change
+	cd src && npm test 
 
 installs:
 	cargo build --release && cd src && npm i
