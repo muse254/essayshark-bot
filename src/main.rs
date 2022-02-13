@@ -98,9 +98,8 @@ fn get_orders(
                 if tries == 5 {
                     error!("{}", err);
                     panic!()
-                } else {
-                    get_orders(client, tries + 1).await
                 }
+                get_orders(client, tries + 1).await
             }
         }
     })
@@ -394,12 +393,11 @@ async fn submit_bid<'a>(
         .await
     {
         Ok(_) => {
-            // info!("{:?}", resp);
             info!("bid submitted for item id: {} ", order_id);
         }
         Err(err) => {
             error!("{}", err);
             panic!()
-        } //info!("bid successfully submitted for item id: {} ", order_id);
+        }
     }
 }
