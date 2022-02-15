@@ -1,17 +1,13 @@
 use bot::types;
-use futures::executor::block_on;
 use http;
 use log::{error, info, trace, warn, LevelFilter};
 use reqwest;
 use select::document::Document;
 use select::predicate::Name;
 use simple_logger::SimpleLogger;
-use std::future::Future;
-use std::pin::Pin;
 use tokio;
 use url::Url;
 
-const BID_TRIES: u8 = 200;
 static COOKIE_FILE: &str = "./src/cookie.txt";
 
 #[tokio::main]
@@ -36,19 +32,16 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .unwrap();
 
-    match get_orders(client.clone(), 1).await.new_items {
-        Some(available_orders) => {
-            // discard all available orders
-            discard_orders(
-                client.clone(),
-                available_orders
-                    .iter()
-                    .map(|order| order.id.to_string())
-                    .collect::<Vec<String>>(),
-            )
-            .await;
-        }
-        None => {}
+    if let Some(available_orders) = get_orders(client.clone()).await.new_items {
+        // discard all available orders
+        discard_orders(
+            client.clone(),
+            available_orders
+                .iter()
+                .map(|order| order.id.to_string())
+                .collect::<Vec<String>>(),
+        )
+        .await;
     }
 
     // wait for new orders and bid iteratively
@@ -67,13 +60,10 @@ fn retrieve_cookie_from_file() -> http::HeaderMap {
     headers
 }
 
-fn get_orders(
-    client: reqwest::Client,
-    tries: u8,
-) -> Pin<Box<dyn Future<Output = types::AvailableOrders>>> {
+async fn get_orders(client: reqwest::Client) -> types::AvailableOrders {
     const URL : &'static str =  "https://essayshark.com/writer/orders/aj_source.html?act=load_list&nobreath=1&session_more_qty=0&session_discarded=0&_=";
-
-    Box::pin(async move {
+    let mut tries: usize = 1;
+    loop {
         match client.get(URL).send().await {
             Ok(resp) =>
             // fetch and deserialize content
@@ -87,22 +77,21 @@ fn get_orders(
                     } else {
                         0
                     }
-                },);
+                });
 
-                orders
+                return orders;
             }
             Err(err) => {
                 warn!("an error occurred retrieving orders: {:?}", err);
-
                 // retry 5 times then exit if failed
                 if tries == 5 {
                     error!("{}", err);
                     panic!()
                 }
-                get_orders(client, tries + 1).await
+                tries += 1;
             }
         }
-    })
+    }
 }
 
 async fn discard_orders(client: reqwest::Client, orders: Vec<String>) {
@@ -135,14 +124,13 @@ async fn find_orders_and_bid(client: &reqwest::Client) {
         info!("finding new orders to bid to");
 
         // find new orders and bid
-        if let Some(available_orders) = get_orders(client.clone(), 1).await.new_items {
+        if let Some(available_orders) = get_orders(client.clone()).await.new_items {
             if available_orders.is_empty() {
                 continue;
             }
 
-            // bid first
-            let mut bids: u8 = 0;
-            let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            // [tokio::task]s are cheap to spawn unlike os threads with the std::thread
+            let mut threads: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             {
                 let ids_str = available_orders
@@ -151,50 +139,50 @@ async fn find_orders_and_bid(client: &reqwest::Client) {
                     .map(|item| item.id.clone())
                     .collect::<Vec<String>>();
                 let client_clone = client.clone();
-                threads.push(std::thread::spawn(move || {
+                threads.push(tokio::spawn(async move {
                     // discard editing_rewrite if any needs discarding
-                    block_on(discard_orders(client_clone, ids_str))
+                    discard_orders(client_clone, ids_str).await
                 }));
             }
 
+            // bids counter
+            let mut bids_counter: u8 = 0;
             // silence orders with the tag edit_rewrite tag or that have been cached
             for item in available_orders
                 .into_iter()
                 .filter(|item| item.service_type_ar.slug != "editing_rewriting")
             {
                 let client_clone = client.clone();
-                // let item_clone = item.copy();
                 let item_id = item.id.clone();
                 let item_min_price_total = item.min_price_total.clone();
                 let item_pages_qty = item.pages_qty.clone();
 
-                // the number of available orders per second won't fly say above 10;
-                // so spawning for every order will be relatively safe
-                threads.push(std::thread::spawn(move || {
-                    block_on({
-                        dispatch_order(client_clone, item_id, item_min_price_total, item_pages_qty)
-                    })
+                threads.push(tokio::spawn(async move {
+                    dispatch_order(client_clone, item_id, item_min_price_total, item_pages_qty)
+                        .await
                 }));
 
-                bids += 1;
+                bids_counter += 1;
             }
 
-            if bids > 0 {
-                info!("trying to bid {} order(s)", bids);
+            if bids_counter > 0 {
+                info!("trying to bid {} order(s)", bids_counter);
             }
 
             // wait for all threads to finish in a seperate thread
             // but continue with program execution; for new orders that might be found
-            std::thread::spawn(move || {
+            tokio::spawn(async move {
                 for thread in threads {
-                    thread.join().unwrap();
+                    if let Err(err) = thread.await {
+                        error!("{}", &err)
+                    }
                 }
             });
         }
     }
 }
 
-async fn dispatch_order<'a>(
+async fn dispatch_order(
     client: reqwest::Client,
     item_id: String,
     min_price_total: f32,
@@ -220,22 +208,19 @@ async fn dispatch_order<'a>(
         item_id.to_owned(),
         min_price_total,
         pages_qty.to_owned(),
-        1,
-        false,
     )
-    .await
     .await;
 }
 
-async fn queue_bid<'a>(
+async fn queue_bid(
     client: reqwest::Client,
     item_id: String,
     min_price_total: f32,
     pages_qty: String,
-    tries: u8,
-    download_dispatch: bool,
-) -> Pin<Box<dyn Future<Output = ()>>> {
-    Box::pin(async move {
+) {
+    let mut tries: u8 = 1;
+    let mut download_dispatch = false;
+    loop {
         match client
             .get(format!(
                 "https://essayshark.com/writer/orders/ping.html?order={}&_=",
@@ -264,51 +249,50 @@ async fn queue_bid<'a>(
                     }
                 }
 
-                // dispatch the queue asynchronously
-                let queue = queue_bid(
-                    client.clone(),
-                    item_id.clone(),
-                    min_price_total,
-                    pages_qty,
-                    tries + 1,
-                    true,
-                );
+                // dispatch the download to happen concurrently
+                if !download_dispatch && order_ping.files_download_remain > 0 {
+                    let client_clone = client.clone();
+                    let item_id_clone = item_id.clone();
+                    tokio::spawn(async move { download_file(client_clone, item_id_clone).await });
+                }
 
-                // dispatch the download asynchronously
-                let routine = std::thread::spawn(move || {
-                    if !download_dispatch && order_ping.files_download_remain > 0 {
-                        block_on(download_file(client, item_id))
-                    }
-                });
-
-                // make sure the queue completes
-                queue.await.await;
-
-                // make sure the download thread completes
-                // uninterested in result; the download data is discarded
-                let _ = routine.join();
+                // update the state of the downlaod dispatched
+                // and tries
+                {
+                    download_dispatch = true;
+                    tries += 1;
+                }
             }
             Err(err) => {
-                if tries.eq(&BID_TRIES) {
+                if tries.eq(&u8::MAX) {
                     error!("{}", err);
                     panic!()
                 }
-                queue_bid(
-                    client.clone(),
-                    item_id,
-                    min_price_total,
-                    pages_qty,
-                    tries + 1,
-                    download_dispatch,
-                )
-                .await
-                .await
             }
         }
-    })
+    }
 }
 
-async fn download_file<'a>(client: reqwest::Client, order_id: String) {
+async fn download_file(client: reqwest::Client, order_id: String) {
+    async fn download_resource_background(client: reqwest::Client, path: String) {
+        // parse url from base
+        let base =
+            Url::parse("https://essayshark.com").expect("hardcoded URL is known to be valid");
+        let joined = base.join(&path);
+
+        match joined {
+            Ok(url) => {
+                if let Some(err) = client.get(url.to_string()).send().await.err() {
+                    warn!("{}", err);
+                }
+                info!("download for url {} completed!", url);
+            }
+            Err(err) => {
+                warn!("{}", err);
+            }
+        }
+    }
+
     match client
         .get(format!(
             "https://essayshark.com/writer/orders/{}.html",
@@ -321,7 +305,7 @@ async fn download_file<'a>(client: reqwest::Client, order_id: String) {
             // retrieve document body & parse as html
             let body = resp.text().await.unwrap();
             let body_owned = body.as_str();
-            {
+            let path = {
                 let doc = Document::from(body_owned);
                 let document = doc
                     .find(Name("a"))
@@ -335,33 +319,18 @@ async fn download_file<'a>(client: reqwest::Client, order_id: String) {
                     })
                     .collect::<Vec<select::node::Node>>();
 
-                async fn download_resource_background(client_owned: reqwest::Client, path: String) {
-                    // parse url from base
-                    let base = Url::parse("https://essayshark.com")
-                        .expect("hardcoded URL is known to be valid");
-                    let joined = base.join(&path);
-
-                    match joined {
-                        Ok(url) => {
-                            if let Some(err) = client_owned.get(url.to_string()).send().await.err()
-                            {
-                                warn!("{}", err);
-                            }
-                            info!("download for url {} completed!", url);
-                        }
-                        Err(err) => {
-                            warn!("{}", err);
-                        }
-                    }
-                }
-
                 // only need to 'download' a single file
-                if let Some(node) = document.first() {
-                    let client_clone = client.clone();
-                    if let Some(url) = node.attr("href") {
-                        download_resource_background(client_clone, url.to_string()).await;
-                    }
+                match document.first() {
+                    Some(&node) => match node.attr("href") {
+                        Some(url) => Some(url.to_string()),
+                        None => None,
+                    },
+                    None => None,
                 }
+            };
+
+            if let Some(url_path) = path {
+                download_resource_background(client, url_path).await;
             }
         }
         Err(err) => {
