@@ -4,8 +4,8 @@ const fs = require('fs')
 let options = {
   uri: 'https://essayshark.com/auth/aj_login2.html?callback=',
   formData: {
-    l: 'cmutungi17@yahoo.com',
-    p: 'Log@nj@b@li2020',
+    l: '', // username/email goes here
+    p: '', // password goes here
     stay_signed_in: 1,
     marketing: 0,
     policy: 0,

@@ -31,3 +31,5 @@ The project's setup is bundled into a `Makefile`. Running:
 make
 ```
 starts the bot.
+
+The cloudflare bypasser seems not to work on Google Cloud but trying it out in AWS does the trick. 

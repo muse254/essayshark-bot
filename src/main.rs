@@ -68,18 +68,23 @@ async fn get_orders(client: reqwest::Client) -> types::AvailableOrders {
             Ok(resp) =>
             // fetch and deserialize content
             {
-                let orders =
+                if let Ok(orders) =
                     serde_json::from_str::<types::AvailableOrders>(&resp.text().await.unwrap())
-                        .unwrap();
-                info!("#{} order(s) found", {
-                    if let Some(item) = &orders.new_items {
-                        item.len()
-                    } else {
-                        0
-                    }
-                });
+                {
+                    info!("#{} order(s) found", {
+                        if let Some(item) = &orders.new_items {
+                            item.len()
+                        } else {
+                            0
+                        }
+                    });
 
-                return orders;
+                    return orders;
+                } else if tries < 5 {
+                    continue;
+                } else {
+                    error!("failed to parse json body!")
+                }
             }
             Err(err) => {
                 warn!("an error occurred retrieving orders: {:?}", err);
@@ -120,6 +125,7 @@ async fn discard_orders(client: reqwest::Client, orders: Vec<String>) {
 }
 
 async fn find_orders_and_bid(client: &reqwest::Client) {
+    let mut cache = types::FixedCache::new();
     loop {
         info!("finding new orders to bid to");
 
@@ -148,10 +154,9 @@ async fn find_orders_and_bid(client: &reqwest::Client) {
             // bids counter
             let mut bids_counter: u8 = 0;
             // silence orders with the tag edit_rewrite tag or that have been cached
-            for item in available_orders
-                .into_iter()
-                .filter(|item| item.service_type_ar.slug != "editing_rewriting")
-            {
+            for item in available_orders.into_iter().filter(|item| {
+                item.service_type_ar.slug != "editing_rewriting" && !cache.id_is_present(&item.id)
+            }) {
                 let client_clone = client.clone();
                 let item_id = item.id.clone();
                 let item_min_price_total = item.min_price_total.clone();
@@ -231,35 +236,47 @@ async fn queue_bid(
         {
             Ok(resp) => {
                 // deserialize response
-                let order_ping =
-                    serde_json::from_str::<types::OrderPing>(&resp.text().await.unwrap()).unwrap();
+                if let Ok(order_ping) =
+                    serde_json::from_str::<types::OrderPing>(&resp.text().await.unwrap())
+                {
+                    info!("order #{} pinged", &item_id);
 
-                info!("order #{} pinged", &item_id);
-
-                if order_ping.read_time_remain == 0 {
-                    let id = item_id.clone();
-                    info!("order #{} bidding", id);
-                    submit_bid(&client, item_id.clone(), min_price_total, pages_qty.clone()).await;
-                    return;
-                } else if order_ping.read_time_remain <= 17 {
-                    if order_ping.pr > 0 {
+                    if order_ping.read_time_remain == 0 {
+                        let id = item_id.clone();
+                        info!("order #{} bidding", id);
                         submit_bid(&client, item_id.clone(), min_price_total, pages_qty.clone())
                             .await;
                         return;
+                    } else if order_ping.read_time_remain <= 17 {
+                        if order_ping.pr > 0 {
+                            submit_bid(
+                                &client,
+                                item_id.clone(),
+                                min_price_total,
+                                pages_qty.clone(),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+
+                    // dispatch the download to happen concurrently
+                    if !download_dispatch && order_ping.files_download_remain > 0 {
+                        let client_clone = client.clone();
+                        let item_id_clone = item_id.clone();
+                        tokio::spawn(
+                            async move { download_file(client_clone, item_id_clone).await },
+                        );
+                    }
+
+                    // update the state of the downlaod dispatched
+                    {
+                        download_dispatch = true;
                     }
                 }
 
-                // dispatch the download to happen concurrently
-                if !download_dispatch && order_ping.files_download_remain > 0 {
-                    let client_clone = client.clone();
-                    let item_id_clone = item_id.clone();
-                    tokio::spawn(async move { download_file(client_clone, item_id_clone).await });
-                }
-
-                // update the state of the downlaod dispatched
-                // and tries
+                // updated the state of tries
                 {
-                    download_dispatch = true;
                     tries += 1;
                 }
             }
