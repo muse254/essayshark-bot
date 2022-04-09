@@ -32,4 +32,4 @@ make
 ```
 starts the bot.
 
-The cloudflare bypasser seems not to work on Google Cloud but trying it out in AWS does the trick. 
+The cloudflare bypasser seems not to work on Google Cloud but trying it out in AWS, `us-east-2` does the trick.
